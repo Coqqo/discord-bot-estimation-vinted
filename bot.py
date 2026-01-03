@@ -69,7 +69,7 @@ def extract_image_urls(message: discord.Message) -> List[str]:
 
 
 def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("{") and text.endswith("}"):
         try:
             return json.loads(text)
@@ -85,10 +85,14 @@ def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def analyze_image(image_url: str) -> Dict[str, Any]:
+async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
+    """
+    Analyse TOUTES les images du message, mais renvoie UNE SEULE estimation globale.
+    """
     instruction = (
-        "Tu es un expert Vinted. À partir de la photo, identifie l'article si possible "
-        "(catégorie, marque, modèle si reconnaissable, détails visibles) et donne une estimation de revente Vinted.\n\n"
+        "Tu es un expert Vinted.\n"
+        "Je t'envoie plusieurs photos du MÊME article (ex: photo générale + étiquette). "
+        "Ton objectif est d'identifier au mieux l'article et de donner UNE estimation de revente Vinted.\n\n"
         "IMPORTANT:\n"
         "- Si tu n'es pas sûr, mets identified=false.\n"
         "- Donne un score confidence entre 0 et 1.\n"
@@ -103,15 +107,16 @@ async def analyze_image(image_url: str) -> Dict[str, Any]:
         "}\n"
     )
 
+    content = [{"type": "input_text", "text": instruction}]
+    for url in image_urls:
+        content.append({"type": "input_image", "image_url": url})
+
     resp = await asyncio.to_thread(
         client.responses.create,
         model=MODEL_NAME,
         input=[{
             "role": "user",
-            "content": [
-                {"type": "input_text", "text": instruction},
-                {"type": "input_image", "image_url": image_url},
-            ],
+            "content": content,
         }],
     )
 
@@ -147,33 +152,31 @@ async def on_message(message: discord.Message):
     if not image_urls:
         return  # on ignore tout sauf les images
 
-    for idx, url in enumerate(image_urls, start=1):
-        try:
-            result = await analyze_image(url)
-        except Exception:
-            await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
-            continue
+    # ✅ IMPORTANT : une seule réponse par message
+    try:
+        result = await analyze_images(image_urls)
+    except Exception as e:
+        print("OpenAI error:", e)
+        await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
+        return
 
-        identified = bool(result.get("identified", False))
-        confidence = float(result.get("confidence", 0.0))
+    identified = bool(result.get("identified", False))
+    confidence = float(result.get("confidence", 0.0))
 
-        if (not identified) or (confidence < CONFIDENCE_THRESHOLD):
-            await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
-            continue
+    if (not identified) or (confidence < CONFIDENCE_THRESHOLD):
+        await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
+        return
 
-        item_name = result.get("item_name") or "cet article"
-        estimate_txt = format_estimate_text(result)
+    item_name = result.get("item_name") or "cet article"
+    estimate_txt = format_estimate_text(result)
 
-        reply = SUCCESS_TEMPLATE.format(
-            mention=message.author.mention,
-            item_name=item_name,
-            estimate_txt=estimate_txt,
-        )
+    reply = SUCCESS_TEMPLATE.format(
+        mention=message.author.mention,
+        item_name=item_name,
+        estimate_txt=estimate_txt,
+    )
 
-        if len(image_urls) > 1:
-            reply = f"🖼️ Image {idx}/{len(image_urls)}\n" + reply
-
-        await message.reply(reply)
+    await message.reply(reply)
 
 
 if __name__ == "__main__":
