@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 
 import discord
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 load_dotenv()
 
@@ -17,9 +17,17 @@ TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID", "0"))
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
+# ✅ Limite d'images analysées par message
+MAX_IMAGES = int(os.getenv("MAX_IMAGES", "2"))
+
 FALLBACK_MSG = (
     "Slt {mention}, désolé je n'arrive pas à identifier l'article sur ta photo 😕 "
     "Renvoie une image plus nette (logo/étiquette bien visible) 🙏"
+)
+
+RATE_LIMIT_MSG = (
+    "⏳ Slt {mention}, j’ai atteint temporairement la limite OpenAI (429). "
+    "Réessaie dans 30–60 secondes 🙏"
 )
 
 SUCCESS_TEMPLATE = (
@@ -36,6 +44,9 @@ intents.messages = True
 bot = discord.Client(intents=intents)
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+# ✅ évite plusieurs appels OpenAI en même temps (réduit les 429)
+ANALYZE_SEMAPHORE = asyncio.Semaphore(1)
 
 
 def is_image_attachment(att: discord.Attachment) -> bool:
@@ -87,7 +98,7 @@ def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
 
 async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
     """
-    Analyse TOUTES les images du message, mais renvoie UNE SEULE estimation globale.
+    Analyse les images du message (limitées à MAX_IMAGES), renvoie UNE SEULE estimation globale.
     """
     instruction = (
         "Tu es un expert Vinted.\n"
@@ -111,14 +122,15 @@ async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
     for url in image_urls:
         content.append({"type": "input_image", "image_url": url})
 
-    resp = await asyncio.to_thread(
-        client.responses.create,
-        model=MODEL_NAME,
-        input=[{
-            "role": "user",
-            "content": content,
-        }],
-    )
+    async with ANALYZE_SEMAPHORE:
+        resp = await asyncio.to_thread(
+            client.responses.create,
+            model=MODEL_NAME,
+            input=[{
+                "role": "user",
+                "content": content,
+            }],
+        )
 
     out_text = getattr(resp, "output_text", "") or ""
     data = safe_parse_json(out_text) or {"identified": False, "confidence": 0.0}
@@ -152,9 +164,21 @@ async def on_message(message: discord.Message):
     if not image_urls:
         return  # on ignore tout sauf les images
 
-    # ✅ IMPORTANT : une seule réponse par message
+    # ✅ Ne garder que les 2 premières images (ou MAX_IMAGES)
+    extra = len(image_urls) - MAX_IMAGES
+    if extra > 0:
+        image_urls = image_urls[:MAX_IMAGES]
+        await message.reply(
+            f"ℹ️ {message.author.mention} j’analyse uniquement les **{MAX_IMAGES} premières images** "
+            f"(j’ai ignoré {extra} autre(s) image(s))."
+        )
+
+    # ✅ Une seule réponse par message
     try:
         result = await analyze_images(image_urls)
+    except RateLimitError:
+        await message.reply(RATE_LIMIT_MSG.format(mention=message.author.mention))
+        return
     except Exception as e:
         print("OpenAI error:", e)
         await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
