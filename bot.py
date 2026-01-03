@@ -22,11 +22,6 @@ FALLBACK_MSG = (
     "Renvoie une image plus nette (logo/étiquette bien visible) 🙏"
 )
 
-SUCCESS_TEMPLATE = (
-    "Slt {mention} ! D'après ce que je vois, tu aimerais une estimation pour **{item_name}**.\n"
-    "À mon avis tu pourrais le revendre {estimate_txt} sur Vinted, à condition qu'il soit en très bon état 😉"
-)
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 intents = discord.Intents.default()
@@ -87,23 +82,31 @@ def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
 
 async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
     """
-    Analyse TOUTES les images du message, mais renvoie UNE SEULE estimation globale.
+    Analyse TOUTES les images du message (même article),
+    mais renvoie UNE SEULE estimation + infos (marque, taille, etc).
     """
     instruction = (
-        "Tu es un expert Vinted.\n"
-        "Je t'envoie plusieurs photos du MÊME article (ex: photo générale + étiquette). "
-        "Ton objectif est d'identifier au mieux l'article et de donner UNE estimation de revente Vinted.\n\n"
+        "Tu es un expert Vinted. Je t'envoie plusieurs photos du MÊME article "
+        "(ex: photo globale + étiquette taille). Analyse-les ensemble.\n\n"
         "IMPORTANT:\n"
         "- Si tu n'es pas sûr, mets identified=false.\n"
-        "- Donne un score confidence entre 0 et 1.\n"
+        "- Donne confidence entre 0 et 1.\n"
+        "- Si un champ n'est pas visible, mets null.\n"
         "- Réponds UNIQUEMENT en JSON valide.\n\n"
         "JSON attendu:\n"
         "{\n"
         '  "identified": true/false,\n'
         '  "confidence": 0.0,\n'
-        '  "item_name": "string",\n'
+        '  "category": "string|null",\n'
+        '  "brand": "string|null",\n'
+        '  "model": "string|null",\n'
+        '  "size": "string|null",\n'
+        '  "color": "string|null",\n'
+        '  "material": "string|null",\n'
+        '  "item_name": "string|null",\n'
         '  "price_range": [min,max] | null,\n'
-        '  "suggested_price": number | null\n'
+        '  "suggested_price": number | null,\n'
+        '  "notes": "string|null"\n'
         "}\n"
     )
 
@@ -136,6 +139,21 @@ def format_estimate_text(result: Dict[str, Any]) -> str:
     return "à un prix correct"
 
 
+def build_details_line(result: Dict[str, Any]) -> str:
+    parts = []
+    for label, key in [
+        ("Marque", "brand"),
+        ("Modèle", "model"),
+        ("Taille", "size"),
+        ("Couleur", "color"),
+        ("Matière", "material"),
+    ]:
+        val = result.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(f"**{label} :** {val.strip()}")
+    return "\n".join(parts)
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Connecté en tant que {bot.user} | salon surveillé: {TARGET_CHANNEL_ID}")
@@ -150,9 +168,9 @@ async def on_message(message: discord.Message):
 
     image_urls = extract_image_urls(message)
     if not image_urls:
-        return  # on ignore tout sauf les images
+        return  # ignore tout sauf images
 
-    # ✅ IMPORTANT : une seule réponse par message
+    # ✅ Une seule analyse + une seule réponse par message
     try:
         result = await analyze_images(image_urls)
     except Exception as e:
@@ -169,11 +187,16 @@ async def on_message(message: discord.Message):
 
     item_name = result.get("item_name") or "cet article"
     estimate_txt = format_estimate_text(result)
+    details = build_details_line(result)
 
-    reply = SUCCESS_TEMPLATE.format(
-        mention=message.author.mention,
-        item_name=item_name,
-        estimate_txt=estimate_txt,
+    notes = result.get("notes")
+    notes_txt = f"\n\n💡 {notes.strip()}" if isinstance(notes, str) and notes.strip() else ""
+
+    reply = (
+        f"Slt {message.author.mention} ! D'après ce que je vois, tu aimerais une estimation pour **{item_name}**.\n"
+        f"À mon avis tu pourrais le revendre {estimate_txt} sur Vinted, à condition qu'il soit en très bon état 😉\n\n"
+        f"{details}"
+        f"{notes_txt}"
     )
 
     await message.reply(reply)
