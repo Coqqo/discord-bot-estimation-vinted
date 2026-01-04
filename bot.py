@@ -1,6 +1,8 @@
 import os
+import re
+import json
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import discord
 from dotenv import load_dotenv
@@ -43,19 +45,20 @@ bot = discord.Client(intents=intents)
 # ✅ évite plusieurs appels OpenAI en même temps (réduit les 429)
 ANALYZE_SEMAPHORE = asyncio.Semaphore(1)
 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
 
 def extract_image_urls(message: discord.Message) -> List[str]:
     urls: List[str] = []
 
     # Attachments
     for att in message.attachments:
-        # content_type fiable si dispo
         if att.content_type and att.content_type.startswith("image/"):
             urls.append(att.url)
             continue
-        # fallback via extension
+
         fn = (att.filename or "").lower()
-        if fn.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        if fn.endswith(IMAGE_EXTS):
             urls.append(att.url)
 
     # Embeds (images / thumbnails)
@@ -75,6 +78,41 @@ def extract_image_urls(message: discord.Message) -> List[str]:
     return out
 
 
+def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Essaie d'extraire un JSON depuis la réponse.
+    Très robuste contre du texte avant/après.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # Cas 1: déjà un objet JSON brut
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+    # Cas 2: JSON dans un bloc ```json ... ```
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+
+    # Cas 3: première occurrence { ... } (greedy contrôlé)
+    m = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            return None
+
+    return None
+
+
 def format_estimate_text(result: Dict[str, Any]) -> str:
     suggested = result.get("suggested_price")
     pr = result.get("price_range")
@@ -92,8 +130,8 @@ def format_estimate_text(result: Dict[str, Any]) -> str:
 
 async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
     """
-    Analyse les images (limitées à MAX_IMAGES côté on_message) et renvoie UNE estimation globale.
-    JSON garanti via json_schema.
+    Analyse les images (max MAX_IMAGES côté on_message) et renvoie UNE estimation globale.
+    Version ultra-compatible: pas de response_format json_schema.
     """
     instruction = (
         "Tu es un expert de la revente sur Vinted (seconde main) en France.\n"
@@ -103,32 +141,19 @@ async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
         "- Par défaut, suppose un article D'OCCASION.\n"
         "- Sois conservateur: si tu hésites, baisse l'estimation.\n"
         "- Donne une fourchette: min = vente rapide, max = vente plus lente mais réaliste.\n"
-        "- Si marque inconnue / peu demandée, reste bas.\n"
+        "- Si la marque est inconnue / peu demandée, reste bas.\n"
         "- Ne te base PAS sur le prix retail.\n\n"
-        "Tu reçois plusieurs photos du MÊME article (photo globale + étiquette). Analyse-les ensemble.\n"
-        "Réponds uniquement avec les champs demandés."
+        "Je t'envoie plusieurs photos du MÊME article (photo globale + étiquette). Analyse-les ensemble.\n\n"
+        "Réponds UNIQUEMENT en JSON valide, sans aucun texte autour.\n"
+        "JSON attendu:\n"
+        "{\n"
+        '  "identified": true/false,\n'
+        '  "confidence": 0.0,\n'
+        '  "item_name": "string",\n'
+        '  "price_range": [min,max] | null,\n'
+        '  "suggested_price": number | null\n'
+        "}\n"
     )
-
-    schema = {
-        "name": "vinted_estimation",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "identified": {"type": "boolean"},
-                "confidence": {"type": "number"},
-                "item_name": {"type": "string"},
-                "price_range": {
-                    "type": ["array", "null"],
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2
-                },
-                "suggested_price": {"type": ["number", "null"]},
-            },
-            "required": ["identified", "confidence", "item_name", "price_range", "suggested_price"],
-            "additionalProperties": False
-        }
-    }
 
     content = [{"type": "input_text", "text": instruction}]
     for url in image_urls:
@@ -138,22 +163,27 @@ async def analyze_images(image_urls: List[str]) -> Dict[str, Any]:
         resp = await asyncio.to_thread(
             client.responses.create,
             model=MODEL_NAME,
-            response_format={"type": "json_schema", "json_schema": schema},
             input=[{"role": "user", "content": content}],
         )
 
-    # JSON garanti par response_format => output_parsed
-    data = getattr(resp, "output_parsed", None)
-    if isinstance(data, dict):
-        return data
+    out_text = getattr(resp, "output_text", "") or ""
+    data = safe_parse_json(out_text)
 
-    # fallback ultra safe (ne devrait pas arriver)
-    return {"identified": False, "confidence": 0.0, "item_name": "cet article", "price_range": None, "suggested_price": None}
+    if not isinstance(data, dict):
+        return {"identified": False, "confidence": 0.0}
+
+    # Normalisation minimale
+    if "identified" not in data:
+        data["identified"] = False
+    if "confidence" not in data:
+        data["confidence"] = 0.0
+
+    return data
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ Connecté en tant que {bot.user} | salon surveillé: {TARGET_CHANNEL_ID} | max images: {MAX_IMAGES}")
+    print(f"✅ Connecté en tant que {bot.user} | salon: {TARGET_CHANNEL_ID} | max images: {MAX_IMAGES} | model: {MODEL_NAME}")
 
 
 @bot.event
@@ -182,6 +212,7 @@ async def on_message(message: discord.Message):
         await message.reply(RATE_LIMIT_MSG.format(mention=message.author.mention))
         return
     except Exception as e:
+        # Log utile dans Railway
         print("OpenAI error:", repr(e))
         await message.reply(FALLBACK_MSG.format(mention=message.author.mention))
         return
@@ -204,7 +235,6 @@ async def on_message(message: discord.Message):
         item_name=item_name,
         estimate_txt=estimate_txt,
     )
-
     await message.reply(reply)
 
 
